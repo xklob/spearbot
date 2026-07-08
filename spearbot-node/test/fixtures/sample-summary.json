@@ -1,0 +1,19 @@
+{
+  "solidity": {
+    "test/fixtures/contracts/SimpleVault.sol": {
+      "filename": "test/fixtures/contracts/SimpleVault.sol",
+      "globalSummary": "SimpleVault tracks deposits and lets users withdraw their own balance.",
+      "chunkedSummaries": {
+        "Vault Deposit Flow": {
+          "title": "Vault Deposit Flow",
+          "summary": "The deposit function increases the sender balance by msg.value.",
+          "content": "function deposit() external payable { balances[msg.sender] += msg.value; }",
+          "tokens": {
+            "summary": 11,
+            "content": 12
+          }
+        }
+      }
+    }
+  }
+}

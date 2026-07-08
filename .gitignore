@@ -72,6 +72,12 @@ typings/
 .env
 .env.test
 
+# Spearbot generated outputs
+defaultQuestions.md
+summarization-results.json
+summarization-results.md
+spearbot-node/vecstore/
+
 # parcel-bundler cache (https://parceljs.org/)
 .cache
 

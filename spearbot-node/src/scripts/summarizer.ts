@@ -1,365 +1,397 @@
+import "dotenv/config";
 import * as tiktoken from "@dqbd/tiktoken";
 import * as fs from "fs";
 import { loadSummarizationChain, MapReduceDocumentsChain } from "langchain/chains";
 import { Document } from "langchain/document";
 import { OpenAI } from "langchain/llms";
-import { MarkdownTextSplitter, RecursiveCharacterTextSplitter, TextSplitter, TokenTextSplitter } from "langchain/text_splitter";
+import {
+  MarkdownTextSplitter,
+  RecursiveCharacterTextSplitter,
+  TextSplitter,
+  TokenTextSplitter
+} from "langchain/text_splitter";
 import * as path from "path";
+import { CliError, readFlagValue, runCli } from "../lib/cli";
+import { getOpenAiModel, isDirectCliEntry } from "../lib/paths";
 import { GenericCodeTextSplitter } from "../extensions/codeSplitter";
 import { ChunkedSummary, SingleFileSummary, Summaries, SummarySetByExtension } from "../types/types";
 
-/* Enums & interfaces */
-
-enum InputFormat {
-    Text = "text",
-    Markdown = "markdown",
-    Solidity = "solidity"
+export enum InputFormat {
+  Text = "text",
+  Markdown = "markdown",
+  Solidity = "solidity"
 }
 
-enum OutputFormat {
-    Json = "json",
-    Markdown = "markdown",
-    Stdout = "stdout"
+export enum OutputFormat {
+  Json = "json",
+  Markdown = "markdown",
+  Stdout = "stdout"
 }
 
-interface ProgOpts {
-    dir: string
-    exts: InputFormat[]
-    out: string
-    format: OutputFormat
+export interface SummarizerOptions {
+  dir: string;
+  exts: InputFormat[];
+  out: string;
+  format: OutputFormat;
 }
 
-/* Usage helpers */
+const inputFormatAliases: Record<string, InputFormat> = {
+  text: InputFormat.Text,
+  txt: InputFormat.Text,
+  markdown: InputFormat.Markdown,
+  md: InputFormat.Markdown,
+  solidity: InputFormat.Solidity,
+  sol: InputFormat.Solidity
+};
 
-function printUsage(exit: boolean = false): void {
-    console.log(`\n
-    spear-sum
-    
-    - recursively summarizes the contents of a directory
-    - supports txt and md files and solidity
-    - outputs results to working directory by default
-    - outputs results as json by default
-   
-    usage:
-   
-    ./summarize.sh --dir <path> --out <path> --exts [text,md,solidity] --format <format>
-   
-    args:
-   
-    --dir <path> - directory to summarize (default: current directory)
-    --exts [exts] - file extensions to summarize (default: [text,md,solidity])
-    --out <path> - filename/path to output results to (default: summarization-results.json)
-    --format <format> - output format (json, md, stdout; default: json)`)
+const extensionByInputFormat: Record<InputFormat, string> = {
+  [InputFormat.Text]: ".txt",
+  [InputFormat.Markdown]: ".md",
+  [InputFormat.Solidity]: ".sol"
+};
 
-    if (exit) {
-        process.exit(1)
-    }
+export function getSummarizerUsage(): string {
+  return `
+spear-sum
+
+Recursively summarizes text, Markdown, and Solidity files.
+
+Usage:
+  ./summarize.sh --dir <path> --out <path> --exts text,md,solidity --format <json|markdown|stdout>
+
+Options:
+  --dir <path>       Directory to summarize. Defaults to the current directory.
+  --exts <list>      Comma-separated formats: text, txt, markdown, md, solidity, sol.
+  --out <path>       Output file path. Defaults to summarization-results.json.
+  --format <format>  Output format: json, markdown, or stdout. Defaults to json.
+`;
 }
 
-function parseArgs(args: string[]): ProgOpts {
-    // instantiate opts with defaults, then override them later if provided by user
-    const options: ProgOpts = {
-        dir: `${process.cwd()}`,
-        exts: [InputFormat.Text, InputFormat.Markdown, InputFormat.Solidity],
-        out: "summarization-results.json",
-        format: OutputFormat.Json
+export function parseSummarizerArgs(
+  args: string[],
+  cwd: string = process.cwd(),
+  validatePaths = true
+): SummarizerOptions {
+  const options: SummarizerOptions = {
+    dir: cwd,
+    exts: [InputFormat.Text, InputFormat.Markdown, InputFormat.Solidity],
+    out: "summarization-results.json",
+    format: OutputFormat.Json
+  };
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+
+    switch (arg) {
+      case "--help":
+      case "-h":
+        throw new CliError("", 0);
+      case "--dir":
+        options.dir = readFlagValue(args, i, arg);
+        i++;
+        break;
+      case "--out":
+        options.out = readFlagValue(args, i, arg);
+        i++;
+        break;
+      case "--exts":
+        options.exts = parseInputFormats(readFlagValue(args, i, arg));
+        i++;
+        break;
+      case "--format":
+        options.format = parseOutputFormat(readFlagValue(args, i, arg));
+        i++;
+        break;
+      default:
+        throw new CliError(`Invalid argument "${arg}"`);
     }
+  }
 
-    if (args.includes("--help")) {
-        // prints usage and exits
-        printUsage(true)
-    }
+  if (validatePaths && !fs.existsSync(options.dir)) {
+    throw new CliError(`Directory ${options.dir} does not exist`);
+  }
 
-    // straight parsing
-    for (let i = 0; i < args.length; i++) {
-        const arg = args[i]
+  if (!options.out) {
+    throw new CliError("Output filename cannot be empty");
+  }
 
-        switch (arg) {
-            case "--dir":
-                options.dir = args[++i]
-                break
-            case "--out":
-                options.out = args[++i]
-                break
-            case "--exts":
-                options.exts = args[++i].split(",") as InputFormat[]
-                break
-            case "--format":
-                options.format = args[++i] as OutputFormat 
-                break
-            default:
-                console.error(`Invalid argument "${arg}"`)
-                printUsage(true)
-        }
-    }
-
-    // validation failure --> print usage and exit
-
-    if (options.dir && !fs.existsSync(options.dir)) {
-        console.error(`Directory ${options.dir} does not exist`)
-        printUsage(true)
-    }
-
-    if (options.format && !Object.values(OutputFormat).includes(options.format)) {
-        console.error(`Invalid format ${options.format}`)
-        printUsage(true)
-    }
-
-    if (options.out === undefined || options.out === "") {
-        console.error(`Invalid output filename ${options.out}`)
-        printUsage(true)
-    }
-
-    return options
+  return options;
 }
 
-/* Run program */
+export async function runSummarizer(
+  options: SummarizerOptions,
+  env: NodeJS.ProcessEnv = process.env
+): Promise<Summaries> {
+  if (!env.OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY env not set. Exiting...");
+  }
 
-async function main() {
-    // parse args
-    const options = parseArgs(process.argv.slice(2))
+  const model = new OpenAI({
+    temperature: 0,
+    openAIApiKey: env.OPENAI_API_KEY,
+    modelName: getOpenAiModel(env),
+    maxTokens: 750
+  });
 
-    // instantate openai
-    if (!process.env.OPENAI_API_KEY) {
-        console.error("OPENAI_API_KEY env not set. Exiting...")
-        process.exit(1)
-    }
+  const summaries = await summarizeDirectory(options, model);
+  outputSummaries(summaries, options.out, options.format);
 
-    const model = new OpenAI({ temperature: 0, openAIApiKey: process.env.OPENAI_API_KEY, modelName: "gpt-4", maxTokens: 750 } )
+  if (options.format !== OutputFormat.Markdown) {
+    fs.writeFileSync("summarization-results.md", generateMarkdown(summaries));
+  }
 
-    // get relevant files
-    const filesByExtension: { [key: string]: string[] } = {}
-    for (const ext of options.exts) {
-        let extension: string
-
-        if (ext === InputFormat.Text) {
-            extension = ".txt"
-        } else if (ext === InputFormat.Markdown) {
-            extension = ".md"
-        } else if (ext === InputFormat.Solidity) {
-            extension = ".sol"
-        } else {
-            console.error(`Invalid extension ${ext}`)
-            printUsage(true)
-            throw new Error("Can't reach.")
-        }
-
-        const files = findFilesWithExtension(options.dir, extension)
-        filesByExtension[ext] = files
-
-        console.log(`Found ${files.length} ${ext} files`)
-    }
-
-    // summarize each set of files
-    const summaries: Summaries = {}
-
-    for (const ext in filesByExtension) {
-        summaries[ext] = await summarizeFiles(filesByExtension[ext], ext as InputFormat, model)
-    }
-
-    // output and we're done
-    outputSummaries(summaries, options.out, options.format)
-
-    // write markdown to file
-    fs.writeFileSync("summarization-results.md", generateMarkdown(summaries))
+  return summaries;
 }
 
-main()
+export async function summarizeDirectory(options: SummarizerOptions, model: OpenAI): Promise<Summaries> {
+  const filesByExtension: Record<string, string[]> = {};
 
-/* Heavy lifting happens here */
+  for (const ext of options.exts) {
+    const files = findFilesWithExtension(options.dir, extensionByInputFormat[ext]);
+    filesByExtension[ext] = files;
+    console.log(`Found ${files.length} ${ext} files`);
+  }
 
-function generateMarkdown(summaries: Summaries): string {
-    const solidity = summaries[InputFormat.Solidity]
+  const summaries: Summaries = {};
 
-    let outputString = "# Solidity\n\n"
-    for (const filename in solidity) {
-        outputString += `## ${filename}\n\n`
+  for (const ext of Object.keys(filesByExtension)) {
+    summaries[ext] = await summarizeFiles(filesByExtension[ext], ext as InputFormat, model);
+  }
 
-        const fileSummaryObj = solidity[filename]
-        const fileSummary = fileSummaryObj.globalSummary
-
-        outputString += `Summary: ${fileSummary}\n\n`
-
-        for (const chunkTitle in fileSummaryObj.chunkedSummaries) {
-            const chunk = fileSummaryObj.chunkedSummaries[chunkTitle]
-            const title = chunk.title
-            const summary = chunk.summary
-
-            outputString += `### ${title}\n\n${summary}\n\n`
-        }
-    }
-
-    return outputString
+  return summaries;
 }
 
-async function summarizeFiles(filenames: string[], ext: InputFormat, model: OpenAI): Promise<SummarySetByExtension> {
-    const summaries: SummarySetByExtension = {}
+export function generateMarkdown(summaries: Summaries): string {
+  const sections: string[] = [];
 
-    for (const filename of filenames) {
-        console.log(`Summarizing ${filename}...`)
+  for (const [format, files] of Object.entries(summaries)) {
+    const lines = [`# ${formatHeadingName(format)}`, ""];
 
-        const contents = fs.readFileSync(filename, "utf8")
-        const fileSummary = await summarizeFile(filename, contents, ext, model)
-        summaries[filename] = fileSummary
-    }
+    for (const [filename, fileSummaryObj] of Object.entries(files)) {
+      lines.push(`## ${filename}`, "", `Summary: ${fileSummaryObj.globalSummary}`, "");
 
-    return summaries
-}
-
-async function summarizeFile(filename: string, content: string, ext: InputFormat, model: OpenAI): Promise<SingleFileSummary> {
-    let summary: SingleFileSummary
-
-    const globalDoc = new Document({pageContent: content})
-    const splitDocs = await splitContent(content, ext)
-
-    // load summarization chain
-    const summarizationChain = loadSummarizationChain(model, {type: "map_reduce"}) as MapReduceDocumentsChain;
-
-    // top level summary
-    console.log(`Summarizing entire file...`)
-
-    let globalDocs = [globalDoc]
-    const tokenCount = await model.getNumTokens(globalDoc.pageContent)
-    
-    if (tokenCount > 3000) {
-        console.log(`File ${filename} is too large to summarize in one go (${tokenCount} tokens). Breaking it up...`)
-
-        const tokenSplitter = new TokenTextSplitter({chunkSize: 1500})
-        globalDocs = await tokenSplitter.splitDocuments(globalDocs)
-    }
-
-    const globalSummary = await summarizationChain.call({
-        input_documents: globalDocs
-        
-    })
-
-    const chunkedSummaries: { [key: string]: ChunkedSummary } = {}
-
-    // chunked summaries
-    
-    const resolvedChunks: ChunkedSummary[] = []
-
-    console.log(`Summarizing ${splitDocs.length} chunks...`)
-
-    const concurrency = 10
-
-    for (let i=0; i<splitDocs.length; i+=concurrency) {
-        const promises: Promise<ChunkedSummary>[] = []
-        
-        console.log(`Summarizing chunks ${i} to min(${i+concurrency}, ${splitDocs.length})...`)
-
-        for (let j=0; j<concurrency; j++) {
-            if (i+j >= splitDocs.length) {
-                break
-            }
-
-            const chunk = splitDocs[i+j]
-            const chunkedSummary = getChunkSummary(chunk, model)
-
-            promises.push(chunkedSummary)
-        }
-
-        const resolved = await Promise.all(promises)
-        resolvedChunks.push(...resolved)
-    }
-
-    for (let chunkSummary of resolvedChunks) {
-        const awaitedSummary = chunkSummary
-        chunkedSummaries[awaitedSummary.title] = awaitedSummary
-    }
-
-    summary = {
-        filename: filename,
-        globalSummary: globalSummary.text as string,
-        chunkedSummaries
-    }
-    
-    return summary
-}
-
-async function getChunkSummary(chunk: Document, model: OpenAI): Promise<ChunkedSummary> {
-    const title = await getThreeWordSummary(chunk.pageContent as string, model)
-
-    const chunkSummaryResult = await model.generate([`Give a detailed and technical summary of the following content:\n${chunk.pageContent}\n`])
-    const chunkSummary = chunkSummaryResult.generations[0][0].text
-
-    const summaryTokens = await getTokenCount(chunkSummary)
-    const contentTokens = await getTokenCount(chunk.pageContent)
-
-    const chunkedSummary: ChunkedSummary = {
-        title: title,
-        summary: chunkSummary,
-        content: chunk.pageContent,
-        tokens: {
-            summary: summaryTokens,
-            content: contentTokens
-        }
-    }
-
-    return chunkedSummary
-}
-
-async function getThreeWordSummary(text: string, model: OpenAI): Promise<string> {
-    const result = await model.generate([`Given the following text, generate a three word identifier/title. Remember ONLY output the three words, and literally nothing else.\n${text}\n\n`])
-    const completion = result.generations[0][0].text
-
-    return completion
-}
-
-/* Utility functions */
-async function getTokenCount(text: string): Promise<number> {
-    const enc = tiktoken.get_encoding('cl100k_base')
-    return enc.encode_ordinary(text).length
-}
-
-function outputSummaries(summaries: Summaries, out: string, format: OutputFormat) {
-    switch (format) {
-        case OutputFormat.Json:
-            fs.writeFileSync(out, JSON.stringify(summaries, null, 2))
-            break
-        case OutputFormat.Markdown:
-            throw new Error("Markdown output not implemented yet.")
-            break
-        case OutputFormat.Stdout:
-            console.log(JSON.stringify(summaries, null, 2))
-            break
-    }
-}
-
-function findFilesWithExtension(directory: string, extension: string): string[] {
-    const foundFileNames: string[] = [];
-    const files = fs.readdirSync(directory);
-  
-    for (const file of files) {
-      const filePath = path.join(directory, file);
-      const fileStat = fs.statSync(filePath);
-  
-      if (fileStat.isDirectory()) {
-        foundFileNames.push(...findFilesWithExtension(filePath, extension));
-      } else if (fileStat.isFile() && path.extname(filePath) === extension) {
-        foundFileNames.push(filePath);
+      for (const chunk of Object.values(fileSummaryObj.chunkedSummaries)) {
+        lines.push(`### ${chunk.title}`, "", chunk.summary, "");
       }
     }
-  
-    return foundFileNames;
+
+    sections.push(lines.join("\n").trimEnd());
+  }
+
+  return sections.length > 0
+    ? `${sections.join("\n\n")}\n`
+    : "# Summary\n\nNo summaries available.\n";
 }
 
-async function splitContent(content: string, contentType: InputFormat): Promise<Document[]> {
-    let splitter: TextSplitter
+export async function summarizeFiles(
+  filenames: string[],
+  ext: InputFormat,
+  model: OpenAI
+): Promise<SummarySetByExtension> {
+  const summaries: SummarySetByExtension = {};
 
-    switch (contentType) {
-        case InputFormat.Text:
-            splitter = new RecursiveCharacterTextSplitter()
-            break;
+  for (const filename of filenames) {
+    console.log(`Summarizing ${filename}...`);
 
-        case InputFormat.Markdown:
-            splitter = new MarkdownTextSplitter()
-            break;
+    const contents = fs.readFileSync(filename, "utf8");
+    const fileSummary = await summarizeFile(filename, contents, ext, model);
+    summaries[filename] = fileSummary;
+  }
 
-        case InputFormat.Solidity:
-            splitter = new GenericCodeTextSplitter(["contract", "interface", "function", "constructor"], {chunkSize: 1, chunkOverlap: 0})
-            break;
+  return summaries;
+}
+
+export async function summarizeFile(
+  filename: string,
+  content: string,
+  ext: InputFormat,
+  model: OpenAI
+): Promise<SingleFileSummary> {
+  const globalDoc = new Document({ pageContent: content });
+  const splitDocs = await splitContent(content, ext);
+  const summarizationChain = loadSummarizationChain(model, { type: "map_reduce" }) as MapReduceDocumentsChain;
+
+  console.log("Summarizing entire file...");
+
+  let globalDocs = [globalDoc];
+  const tokenCount = await model.getNumTokens(globalDoc.pageContent);
+
+  if (tokenCount > 3000) {
+    console.log(`File ${filename} is too large to summarize in one go (${tokenCount} tokens). Breaking it up...`);
+    globalDocs = await new TokenTextSplitter({ chunkSize: 1500 }).splitDocuments(globalDocs);
+  }
+
+  const globalSummary = await summarizationChain.call({
+    input_documents: globalDocs
+  });
+
+  const chunkedSummaries: Record<string, ChunkedSummary> = {};
+  const resolvedChunks: ChunkedSummary[] = [];
+  const concurrency = 10;
+
+  console.log(`Summarizing ${splitDocs.length} chunks...`);
+
+  for (let i = 0; i < splitDocs.length; i += concurrency) {
+    const promises: Promise<ChunkedSummary>[] = [];
+
+    console.log(`Summarizing chunks ${i} to ${Math.min(i + concurrency, splitDocs.length)}...`);
+
+    for (let j = 0; j < concurrency; j++) {
+      if (i + j >= splitDocs.length) {
+        break;
+      }
+
+      promises.push(getChunkSummary(splitDocs[i + j], model));
     }
 
-    return splitter.createDocuments([content])
+    resolvedChunks.push(...await Promise.all(promises));
+  }
+
+  for (const chunkSummary of resolvedChunks) {
+    chunkedSummaries[chunkSummary.title] = chunkSummary;
+  }
+
+  return {
+    filename,
+    globalSummary: globalSummary.text as string,
+    chunkedSummaries
+  };
+}
+
+export async function getChunkSummary(chunk: Document, model: OpenAI): Promise<ChunkedSummary> {
+  const title = await getThreeWordSummary(chunk.pageContent, model);
+  const chunkSummaryResult = await model.generate([
+    `Give a detailed and technical summary of the following content:\n${chunk.pageContent}\n`
+  ]);
+  const chunkSummary = chunkSummaryResult.generations[0][0].text;
+
+  return {
+    title,
+    summary: chunkSummary,
+    content: chunk.pageContent,
+    tokens: {
+      summary: await getTokenCount(chunkSummary),
+      content: await getTokenCount(chunk.pageContent)
+    }
+  };
+}
+
+export async function getThreeWordSummary(text: string, model: OpenAI): Promise<string> {
+  const result = await model.generate([
+    `Given the following text, generate a three word identifier/title. Remember ONLY output the three words, and literally nothing else.\n${text}\n\n`
+  ]);
+
+  return result.generations[0][0].text.trim();
+}
+
+export async function getTokenCount(text: string): Promise<number> {
+  const enc = tiktoken.get_encoding("cl100k_base");
+  return enc.encode_ordinary(text).length;
+}
+
+export function outputSummaries(summaries: Summaries, out: string, format: OutputFormat): void {
+  switch (format) {
+    case OutputFormat.Json:
+      fs.writeFileSync(out, JSON.stringify(summaries, null, 2));
+      break;
+    case OutputFormat.Markdown:
+      fs.writeFileSync(out, generateMarkdown(summaries));
+      break;
+    case OutputFormat.Stdout:
+      console.log(JSON.stringify(summaries, null, 2));
+      break;
+  }
+}
+
+export function findFilesWithExtension(directory: string, extension: string): string[] {
+  const foundFileNames: string[] = [];
+  const files = fs.readdirSync(directory).sort();
+
+  for (const file of files) {
+    const filePath = path.join(directory, file);
+    const fileStat = fs.statSync(filePath);
+
+    if (fileStat.isDirectory()) {
+      foundFileNames.push(...findFilesWithExtension(filePath, extension));
+    } else if (fileStat.isFile() && path.extname(filePath) === extension) {
+      foundFileNames.push(filePath);
+    }
+  }
+
+  return foundFileNames;
+}
+
+export async function splitContent(content: string, contentType: InputFormat): Promise<Document[]> {
+  let splitter: TextSplitter;
+
+  switch (contentType) {
+    case InputFormat.Text:
+      splitter = new RecursiveCharacterTextSplitter();
+      break;
+    case InputFormat.Markdown:
+      splitter = new MarkdownTextSplitter();
+      break;
+    case InputFormat.Solidity:
+      splitter = new GenericCodeTextSplitter(["contract", "interface", "function", "constructor"], {
+        chunkSize: 1,
+        chunkOverlap: 0
+      });
+      break;
+  }
+
+  return splitter.createDocuments([content]);
+}
+
+export async function main(args: string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env): Promise<number> {
+  try {
+    const options = parseSummarizerArgs(args);
+    await runSummarizer(options, env);
+    return 0;
+  } catch (error) {
+    if (error instanceof CliError) {
+      if (error.message) {
+        console.error(error.message);
+      }
+      if (error.showUsage) {
+        console.log(getSummarizerUsage());
+      }
+      return error.exitCode;
+    }
+
+    console.error(error instanceof Error ? error.message : String(error));
+    return 1;
+  }
+}
+
+function parseInputFormats(value: string): InputFormat[] {
+  const formats = value.split(",")
+    .map((format) => inputFormatAliases[format.trim().toLowerCase()])
+    .filter((format): format is InputFormat => Boolean(format));
+
+  if (formats.length === 0 || formats.length !== value.split(",").length) {
+    throw new CliError(`Invalid extension list "${value}"`);
+  }
+
+  return formats;
+}
+
+function parseOutputFormat(value: string): OutputFormat {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "md") {
+    return OutputFormat.Markdown;
+  }
+
+  if (!Object.values(OutputFormat).includes(normalized as OutputFormat)) {
+    throw new CliError(`Invalid format "${value}"`);
+  }
+
+  return normalized as OutputFormat;
+}
+
+function formatHeadingName(value: string): string {
+  return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+if (isDirectCliEntry(import.meta.url)) {
+  void runCli(() => main());
 }

@@ -1,20 +1,27 @@
-# Spearbot
+# Spearbot Node Package
 
-# Purpose / Why Is This Useful?
- - the below script primitives, while useful on their own, are primarily useful when composed with each other and other tools to create fully functional, ai powered tools. for example, the first tool is:
+This directory contains the TypeScript implementation for Spearbot. Most users should run the root wrapper scripts, while contributors can run the package scripts directly from this directory.
 
-### spearbit-analyzer (chatbot)
- - what is this: it's a chatbot that has access to the outputs of the below primitives
- - what can it do: answer questions about the codebase it was fed
-    - "find me all public functions in solidity"
-    - "what does the documentation say about (some function)?
-    - "give me all modifiers used in the codebase"
-    - "what is the auth style used in this contract?"
+## Commands
 
-### Script Primitives
-- doc - generates documentation of code. optionally uses existing documentation to assist. can output in various forms (html, markdown, plaintext)
-- sum - generates hierarchical summaries of code (ie at line, function, class, and file levels). can output in various forms (html, markdown, plaintext)
-- emb - generates embeddings of code at various chunking levels (ie at line, function, class, and file levels if possible (class & file levesl likely only possible with gpt4-32k))
+```sh
+npm install
+export OPENAI_API_KEY=<your-api-key>
+npm run typecheck
+npm test
+npm run summarize -- --dir put_files_to_audit_here
+npm run embed -- --in ../summarization-results.json
+npm run analyze -- "What modifiers are used in each contract?"
+```
 
-### TODO / Improvements:
-- [ ] create hierarchical embeddings so that we can use a higher number for k-nearest-neighbor search
+## Modules
+
+- `src/scripts/summarizer.ts`: discovers supported files, summarizes them, and writes JSON or Markdown output.
+- `src/scripts/embedder.ts`: converts summarization JSON into embedding documents and saves an HNSW index.
+- `src/scripts/analyzer.ts`: asks natural-language questions against the local vector index.
+- `src/scripts/defaults.ts`: runs a short built-in question set.
+- `src/extensions/codeSplitter.ts`: custom text splitters for code-oriented chunks.
+
+The scripts are safe to import in tests because CLI execution is gated behind direct entrypoint checks.
+
+When using the root wrapper scripts, paths are resolved from the directory where the wrapper is invoked. When using `npm run` from this package directory, paths are resolved from `spearbot-node/`.

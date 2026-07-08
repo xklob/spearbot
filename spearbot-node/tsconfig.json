@@ -2,6 +2,8 @@
   "compilerOptions": {
     "target": "EsNext",
     "module": "ESNext",
+    "lib": ["ES2023"],
+    "types": ["node", "vitest"],
     "strictPropertyInitialization": false,
     "noImplicitAny": true,
     "esModuleInterop": true,
@@ -11,6 +13,7 @@
     "resolveJsonModule": true,
     "sourceMap": true,
     "strictNullChecks": true,
-    "strict": true
+    "strict": true,
+    "skipLibCheck": true
   }
 }

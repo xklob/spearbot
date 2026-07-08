@@ -1,190 +1,238 @@
-import { OpenAIEmbeddings } from "langchain/embeddings"
-import { HNSWLib } from "langchain/vectorstores";
+import "dotenv/config";
 import * as fs from "fs";
-import { SingleFileSummary, Summaries } from "../types/types";
-import { OpenAIChat } from "langchain/llms";
 import { Document } from "langchain/document";
+import { OpenAIChat } from "langchain/llms";
+import { OpenAIEmbeddings } from "langchain/embeddings";
+import { HNSWLib } from "langchain/vectorstores";
+import { CliError, readFlagValue, runCli } from "../lib/cli";
+import { getDefaultVectorStorePath, getOpenAiModel, isDirectCliEntry } from "../lib/paths";
+import { SingleFileSummary, Summaries } from "../types/types";
 
-/* Enums & interfaces */
-
-enum InputFormat {
-    Json = "json",
-    Text = "text"
+export enum EmbedderInputFormat {
+  Json = "json",
+  Text = "text"
 }
 
-enum OutputFormat {
-    Pinecone = "pinecone",
-    HNSWIndex = "hnsw",
-    Both = "both"
+export enum EmbedderOutputFormat {
+  Pinecone = "pinecone",
+  HNSWIndex = "hnsw",
+  Both = "both"
 }
 
-interface ProgOpts {
-    in: string
-    fmt: InputFormat
-    out: OutputFormat
-    outfile: string
+export interface EmbedderOptions {
+  inputFile: string;
+  inputFormat: EmbedderInputFormat;
+  outputFormat: EmbedderOutputFormat;
+  outputDir: string;
 }
 
-/* Usage helpers */
+export interface EmbeddingDocuments {
+  texts: string[];
+  docs: Document[];
+}
 
-function printUsage(exit: boolean = false): void {
-    console.log(`\n
-    spear-emb
-    
-    - creates embeddings over a given set of texts
-    - optionally uploads to a given vector db
-   
-    usage:
-   
-    ./embedder.sh --in <path> --fmt <json|text> --out <pinecone|hnsw|both> --outfile <path>
-   
-    args:
+export function getEmbedderUsage(): string {
+  return `
+spear-emb
 
-    --in <path> - path to input file (default: none)
-    --fmt <json|text> - input format (default: json)
-    --out <pinecone|hnsw|both> - output format (default: hnsw)
-    --outfdir <path> - path to output directory, only for hnsw (default: './vecstore/embeddings')`)
-   
-    if (exit) {
-        process.exit(1)
+Creates embeddings over a summarization JSON file and saves a local HNSW index.
+
+Usage:
+  ./embedder.sh --in <path> --fmt <json|text> --out <hnsw|pinecone|both> --outdir <path>
+
+Options:
+  --in <path>      Path to summarization JSON. Required.
+  --fmt <format>   Input format. Only json is currently supported.
+  --out <format>   Output target. hnsw is supported; pinecone and both fail clearly.
+  --outdir <path>  HNSW output directory. Defaults to spearbot-node/vecstore/embeddings.
+`;
+}
+
+export function parseEmbedderArgs(
+  args: string[],
+  cwd: string = process.cwd(),
+  validatePaths = true
+): EmbedderOptions {
+  const options: EmbedderOptions = {
+    inputFile: "",
+    inputFormat: EmbedderInputFormat.Json,
+    outputFormat: EmbedderOutputFormat.HNSWIndex,
+    outputDir: getDefaultVectorStorePath(cwd)
+  };
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+
+    switch (arg) {
+      case "--help":
+      case "-h":
+        throw new CliError("", 0);
+      case "--in":
+        options.inputFile = readFlagValue(args, i, arg);
+        i++;
+        break;
+      case "--fmt":
+        options.inputFormat = parseInputFormat(readFlagValue(args, i, arg));
+        i++;
+        break;
+      case "--out":
+        options.outputFormat = parseOutputFormat(readFlagValue(args, i, arg));
+        i++;
+        break;
+      case "--outdir":
+      case "--outfile":
+        options.outputDir = readFlagValue(args, i, arg);
+        i++;
+        break;
+      default:
+        throw new CliError(`Invalid argument "${arg}"`);
     }
+  }
+
+  if (!options.inputFile) {
+    throw new CliError("Input file not specified");
+  }
+
+  if (validatePaths && !fs.existsSync(options.inputFile)) {
+    throw new CliError(`Input file ${options.inputFile} does not exist`);
+  }
+
+  if (options.inputFormat === EmbedderInputFormat.Text) {
+    throw new CliError("Text input format is not supported yet");
+  }
+
+  return options;
 }
 
-function parseArgs(args: string[]): ProgOpts {
-    // instantiate opts with defaults, then override them later if provided by user
-    const options: ProgOpts = {
-        in: "",
-        fmt: InputFormat.Json,
-        out: OutputFormat.HNSWIndex,
-        outfile: `${process.cwd()}/spearbot-node/vecstore/embeddings`
-    }
+export async function runEmbedder(
+  options: EmbedderOptions,
+  env: NodeJS.ProcessEnv = process.env
+): Promise<EmbeddingDocuments> {
+  if (options.outputFormat !== EmbedderOutputFormat.HNSWIndex) {
+    throw new Error("Only local HNSW output is supported right now.");
+  }
 
-    if (args.includes("--help")) {
-        // prints usage and exits
-        printUsage(true)
-    }
+  if (!env.OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY env not set. Exiting...");
+  }
 
-    // straight parsing
-    for (let i = 0; i < args.length; i++) {
-        const arg = args[i]
+  const input = readSummariesFromFile(options.inputFile);
+  const model = new OpenAIChat({ modelName: getOpenAiModel(env) });
+  const embeddings = new OpenAIEmbeddings();
+  const embeddingDocuments = await buildEmbeddingDocuments(input, async (globalSummary) => {
+    const result = await model.generate([
+      `Give a one sentence summary of the following. Only give the sentence and do not say anything else: ${globalSummary}`
+    ]);
+    return result.generations[0][0].text.trim();
+  });
 
-        switch (arg) {
-            case "--in":
-                options.in = args[++i]
-                break
-            case "--fmt":
-                options.fmt = args[++i] as InputFormat
-                break
-            case "--out":
-                options.out = args[++i] as OutputFormat
-                break
-            case "--outdir":
-                options.outfile = args[++i] as string
-                break
-            default:
-                console.error(`Invalid argument "${arg}"`)
-                printUsage(true)
+  if (embeddingDocuments.docs.length === 0) {
+    throw new Error("No summary chunks found to embed.");
+  }
+
+  console.log("Creating embeddings...");
+  const embeds = await embeddings.embedDocuments(embeddingDocuments.texts);
+  console.log("Embeddings created.");
+
+  const hnsw = new HNSWLib(embeddings, { space: "cosine" });
+  await hnsw.addVectors(embeds, embeddingDocuments.docs);
+  await hnsw.save(options.outputDir);
+  console.log(`Saved HNSW index to ${options.outputDir}`);
+
+  return embeddingDocuments;
+}
+
+export function readSummariesFromFile(inputFile: string): Summaries {
+  try {
+    return JSON.parse(fs.readFileSync(inputFile, "utf-8")) as Summaries;
+  } catch (error) {
+    throw new Error(`Unable to read summarization JSON from ${inputFile}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+export async function buildEmbeddingDocuments(
+  summaries: Summaries,
+  summarizeGlobalSummary: (globalSummary: string) => string | Promise<string> = (globalSummary) => globalSummary
+): Promise<EmbeddingDocuments> {
+  const soliditySummaries = summaries.solidity;
+
+  if (!soliditySummaries) {
+    throw new Error("Summarization input does not contain a solidity section.");
+  }
+
+  const texts: string[] = [];
+  const docs: Document[] = [];
+  const fileSummaries: SingleFileSummary[] = Object.values(soliditySummaries);
+
+  for (let i = 0; i < fileSummaries.length; i++) {
+    const fileSummary = fileSummaries[i];
+    console.log(`Preparing embeddings for file ${i + 1} of ${fileSummaries.length}...`);
+
+    const globalShortSummary = await summarizeGlobalSummary(fileSummary.globalSummary);
+    const chunkSummaries = Object.values(fileSummary.chunkedSummaries);
+
+    for (const chunkSummary of chunkSummaries) {
+      const pageContent = [
+        `File Context: ${globalShortSummary}`,
+        `Section Summary: ${chunkSummary.summary}`,
+        `Section Content: ${chunkSummary.content}`
+      ].join("\n\n");
+
+      texts.push(pageContent);
+      docs.push(new Document({
+        pageContent,
+        metadata: {
+          filename: fileSummary.filename,
+          title: chunkSummary.title
         }
+      }));
     }
+  }
 
-    // validation failure --> print usage and exit
-
-    if (!options.in) {
-        console.error(`Input file not specified`)
-        printUsage(true)
-    }
-
-    if (options.in && !fs.existsSync(options.in)) {
-        console.error(`Input file ${options.in} does not exist`)
-        printUsage(true)
-    }
-
-    if (options.fmt && !Object.values(InputFormat).includes(options.fmt)) {
-        console.error(`Invalid format ${options.fmt}`)
-        printUsage(true)
-    }
-
-    if (options.fmt == InputFormat.Text) {
-        console.error(`Text format not supported yet`)
-        printUsage(true)
-    }
-
-    return options
+  return { texts, docs };
 }
 
-/* Run program */
-
-async function main() {
-    // parse args
-    const options = parseArgs(process.argv.slice(2))
-
-    // instantate openai
-    if (!process.env.OPENAI_API_KEY) {
-        console.error("OPENAI_API_KEY env not set. Exiting...")
-        printUsage(true)
+export async function main(args: string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env): Promise<number> {
+  try {
+    const options = parseEmbedderArgs(args);
+    await runEmbedder(options, env);
+    return 0;
+  } catch (error) {
+    if (error instanceof CliError) {
+      if (error.message) {
+        console.error(error.message);
+      }
+      if (error.showUsage) {
+        console.log(getEmbedderUsage());
+      }
+      return error.exitCode;
     }
 
-    const embeddings = new OpenAIEmbeddings()
-    const model = new OpenAIChat({modelName: "gpt-4"})
-    
-    // read input file
-    const rawInput = fs.readFileSync(options.in, "utf-8")
-    const input = JSON.parse(rawInput) as Summaries
-
-    // input should be in *summaries* form
-    // todo: when we add in text format, we'll need this logic differently
-
-    const soliditySummaries = input["solidity"]
-    const fileNames = Object.keys(soliditySummaries)
-    const fileSummaries: SingleFileSummary[] = fileNames.map((fileName) => soliditySummaries[fileName])
-
-    const embeds: number[][] = []
-    const docs: Document[] = []
-
-    // create embeddings for each file summary
-    for (let i=0; i<fileSummaries.length; i++) {
-        console.log(`Creating embeddings for file ${i+1} of ${fileSummaries.length}...`)
-
-        const fileSummary = fileSummaries[i]
-        const globalSummary  = fileSummary.globalSummary
-        const chunkedSummaries = fileSummary.chunkedSummaries
-        const chunkNames = Object.keys(chunkedSummaries)
-        const chunkSummaries = chunkNames.map((chunkName) => chunkedSummaries[chunkName])
-
-        // creat a short global summary so that the global context is embedded here as well
-        const globalSummaryResult = await model.generate([`Give a one sentence summary fo the following. Only give the sentence and do not say anything else: ${globalSummary}`])
-        const globalShortSummary  = globalSummaryResult.generations[0][0].text
-
-        const toEmbeds: string[] = []
-
-        for (const chunkSummary of chunkSummaries) {
-            const { summary, content } = chunkSummary
-            const toEmbed = "File Context: " + globalShortSummary + "\n\nSection Summary: " + summary + "\n\nSection Content: " + content
-            const doc = new Document({pageContent: toEmbed})
-            toEmbeds.push(toEmbed)
-            docs.push(doc)
-        }
-
-        // create embeddings
-        const embeddingsResult = await embeddings.embedDocuments(toEmbeds)
-        embeds.push(...embeddingsResult)
-    }
-
-    console.log(`Embeddings created.`)
-
-    // embeds created
-    // now save to vector store(s)
-
-    if (options.out == OutputFormat.HNSWIndex || options.out == OutputFormat.Both) {
-        const hnsw = new HNSWLib(embeddings, {space: "cosine"})
-        await hnsw.addVectors(embeds, docs)
-        await hnsw.save(options.outfile)
-        console.log(`Saved HNSW index to ${options.outfile}`)
-    }
-
-    if (options.out == OutputFormat.Pinecone || options.out == OutputFormat.Both) {
-        throw new Error("Pinecone not supported yet")
-    }
+    console.error(error instanceof Error ? error.message : String(error));
+    return 1;
+  }
 }
 
-main()
+function parseInputFormat(value: string): EmbedderInputFormat {
+  const normalized = value.trim().toLowerCase();
+
+  if (!Object.values(EmbedderInputFormat).includes(normalized as EmbedderInputFormat)) {
+    throw new CliError(`Invalid input format "${value}"`);
+  }
+
+  return normalized as EmbedderInputFormat;
+}
+
+function parseOutputFormat(value: string): EmbedderOutputFormat {
+  const normalized = value.trim().toLowerCase();
+
+  if (!Object.values(EmbedderOutputFormat).includes(normalized as EmbedderOutputFormat)) {
+    throw new CliError(`Invalid output format "${value}"`);
+  }
+
+  return normalized as EmbedderOutputFormat;
+}
+
+if (isDirectCliEntry(import.meta.url)) {
+  void runCli(() => main());
+}

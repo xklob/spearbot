@@ -1,2 +1,4 @@
 #!/bin/sh
-exec ts-node --esm --experimental-specifier-resolution=node "spearbot-node/src/scripts/embedder.ts" "$@"
+SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
+PATH="$SCRIPT_DIR/spearbot-node/node_modules/.bin:$PATH"
+exec tsx "$SCRIPT_DIR/spearbot-node/src/scripts/embedder.ts" "$@"

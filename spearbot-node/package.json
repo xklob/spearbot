@@ -1,10 +1,20 @@
 {
   "name": "spearbot",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "TypeScript tools for summarizing and querying Solidity audit targets with local embeddings.",
+  "main": "src/scripts/analyzer.ts",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "summarize": "tsx src/scripts/summarizer.ts",
+    "embed": "tsx src/scripts/embedder.ts",
+    "analyze": "tsx src/scripts/analyzer.ts",
+    "defaults": "tsx src/scripts/defaults.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "audit:critical": "npm audit --audit-level=critical"
+  },
+  "engines": {
+    "node": ">=18 <21"
   },
   "repository": {
     "type": "git",
@@ -18,14 +28,16 @@
   "homepage": "https://github.com/kryptoklob/spearbot#readme",
   "dependencies": {
     "@dqbd/tiktoken": "^1.0.4",
-    "@pinecone-database/pinecone": "^0.0.10",
     "dotenv": "^16.0.3",
     "hnswlib-node": "^1.4.2",
-    "langchain": "^0.0.51",
-    "ts-extras": "^0.11.0",
-    "ts-node": "^10.9.1",
-    "typechain": "^8.1.1",
-    "typescript": "^5.0.3"
+    "langchain": "^0.0.51"
   },
-  "type": "module"
+  "type": "module",
+  "devDependencies": {
+    "@types/node": "^18.19.130",
+    "tsx": "^4.23.0",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.3",
+    "vitest": "^3.2.6"
+  }
 }
